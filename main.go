@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256" // SECURITY: domain-separation for KDF
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
@@ -35,11 +36,19 @@ const (
 	outDirEncrypt          = "encrypted_files"
 	outDirDecrypt          = "decrypted_files"
 
-	// Argon2id parameters
+	// Argon2id parameters (defaults for encrypt)
 	aTime       = uint32(4)
 	aMemoryKiB  = uint32(256 * 1024) // 256 MiB in KiB
 	aParallel   = uint8(4)
 	derivedKeyL = uint32(32)
+
+	// SECURITY: caps/minima for KDF params accepted from files (defense vs DoS)
+	kdfMinTimeCost  = uint32(1)
+	kdfMaxTimeCost  = uint32(10)
+	kdfMinMemoryKiB = uint32(64 * 1024)   // 64 MiB
+	kdfMaxMemoryKiB = uint32(1024 * 1024) // 1 GiB
+	kdfMinParallel  = uint8(1)
+	kdfMaxParallel  = uint8(8)
 )
 
 // Header is serialized exactly in the order of fields below (little-endian for integers).
@@ -62,13 +71,13 @@ func EncodeHeader(h *Header) []byte {
 	buf.Grow(73)
 	buf.Write(h.Magic[:])
 	buf.WriteByte(h.Version)
-	binary.Write(buf, binary.LittleEndian, h.TimeCost)
-	binary.Write(buf, binary.LittleEndian, h.MemoryKiB)
+	_ = binary.Write(buf, binary.LittleEndian, h.TimeCost)
+	_ = binary.Write(buf, binary.LittleEndian, h.MemoryKiB)
 	buf.WriteByte(h.Parallel)
-	binary.Write(buf, binary.LittleEndian, h.ChunkSize)
+	_ = binary.Write(buf, binary.LittleEndian, h.ChunkSize)
 	buf.Write(h.Salt[:])
 	buf.Write(h.BaseNonce[:])
-	binary.Write(buf, binary.LittleEndian, h.FileSize)
+	_ = binary.Write(buf, binary.LittleEndian, h.FileSize)
 	return buf.Bytes()
 }
 
@@ -137,6 +146,7 @@ func ReadHeader(r io.Reader) (*Header, []byte, error) {
 	return h, headerBytes, nil
 }
 
+// SECURITY: zeroizer hardened with KeepAlive to prevent dead-store elimination.
 func zeroize(b []byte) {
 	if b == nil {
 		return
@@ -144,6 +154,7 @@ func zeroize(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+	runtime.KeepAlive(b)
 }
 
 func genRandom(n int) ([]byte, error) {
@@ -152,8 +163,22 @@ func genRandom(n int) ([]byte, error) {
 	return b, err
 }
 
-func deriveKeyArgon2id(pw, salt []byte, t uint32, mKiB uint32, p uint8, keyLen uint32) []byte {
-	return argon2.IDKey(pw, salt, t, mKiB, uint8(p), uint32(keyLen))
+// SECURITY: domain-separated salt for Argon2id to avoid cross-protocol key reuse.
+// salt' = SHA-256("SECFILE\x00kdfv1" || salt)
+func contextSalt(salt []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte("SECFILE\x00kdfv1"))
+	h.Write(salt)
+	sum := h.Sum(nil)
+	return sum // 32 bytes
+}
+
+// SECURITY: wrapper that applies domain separation before calling Argon2id.
+func deriveKey(pw, salt []byte, t uint32, mKiB uint32, p uint8, keyLen uint32) []byte {
+	ctxSalt := contextSalt(salt)
+	key := argon2.IDKey(pw, ctxSalt, t, mKiB, uint8(p), uint32(keyLen))
+	zeroize(ctxSalt)
+	return key
 }
 
 func deriveChunkNonce(base [baseNonceSize]byte, idx uint64) [baseNonceSize]byte {
@@ -167,6 +192,19 @@ func deriveChunkNonce(base [baseNonceSize]byte, idx uint64) [baseNonceSize]byte 
 		out[i] ^= ctr[i]
 	}
 	return out
+}
+
+// SECURITY: construct AAD = headerBytes || chunkIdxLE || plenLE
+func makeAAD(headerBytes []byte, chunkIdx uint64, plen uint32) []byte {
+	aad := make([]byte, 0, len(headerBytes)+8+4)
+	aad = append(aad, headerBytes...)
+	var idxLE [8]byte
+	binary.LittleEndian.PutUint64(idxLE[:], chunkIdx)
+	aad = append(aad, idxLE[:]...)
+	var lenLE [4]byte
+	binary.LittleEndian.PutUint32(lenLE[:], plen)
+	aad = append(aad, lenLE[:]...)
+	return aad
 }
 
 type task struct {
@@ -453,8 +491,8 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 	copy(baseNonceArr[:], baseNonce)
 	zeroize(baseNonce)
 
-	// Derive key
-	key := deriveKeyArgon2id(pw, saltArr[:], aTime, aMemoryKiB, aParallel, derivedKeyL)
+	// Derive key (SECURITY: domain-separated Argon2id)
+	key := deriveKey(pw, saltArr[:], aTime, aMemoryKiB, aParallel, derivedKeyL)
 	defer zeroize(key)
 
 	aead, err := chacha20poly1305.New(key)
@@ -485,10 +523,10 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 	buf := make([]byte, defaultChunkSize)
 	defer zeroize(buf)
 
-	reader := bufio.NewReader(in)
+	// SECURITY: read directly from file; avoid extra plaintext buffering with bufio.Reader
 	chunkIdx := uint64(0)
 	for {
-		n, readErr := io.ReadFull(reader, buf)
+		n, readErr := io.ReadFull(in, buf)
 		if readErr == io.EOF {
 			break
 		}
@@ -499,18 +537,17 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		}
 
 		pt := buf[:n]
-		nonce := deriveChunkNonce(h.BaseNonce, chunkIdx)
-		aad := make([]byte, 0, len(headerBytes)+8)
-		aad = append(aad, headerBytes...)
-		var idxLE [8]byte
-		binary.LittleEndian.PutUint64(idxLE[:], chunkIdx)
-		aad = append(aad, idxLE[:]...)
 
 		// Write plaintext length (uint32 LE)
 		var len32 uint32 = uint32(len(pt))
 		if err := binary.Write(out, binary.LittleEndian, len32); err != nil {
 			return fmt.Errorf("failed to write chunk length: %w", err)
 		}
+
+		nonce := deriveChunkNonce(h.BaseNonce, chunkIdx)
+
+		// SECURITY: bind length into AAD
+		aad := makeAAD(headerBytes, chunkIdx, len32)
 
 		ct := aead.Seal(nil, nonce[:], pt, aad)
 
@@ -522,6 +559,7 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		for i := 0; i < len(pt); i++ {
 			pt[i] = 0
 		}
+		runtime.KeepAlive(pt) // SECURITY: ensure wipe isn't optimized away
 
 		processed += int64(n)
 		pct := int(float64(processed) * 100 / float64(fi.Size()))
@@ -535,6 +573,25 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		}
 	}
 
+	return nil
+}
+
+// SECURITY: validate/cap KDF params from header before Argon2 to prevent DoS.
+func validateKDFParams(t uint32, mKiB uint32, p uint8) error {
+	if t < kdfMinTimeCost || t > kdfMaxTimeCost {
+		return fmt.Errorf("argon2 timeCost out of bounds: %d (allowed %d..%d)", t, kdfMinTimeCost, kdfMaxTimeCost)
+	}
+	if mKiB < kdfMinMemoryKiB || mKiB > kdfMaxMemoryKiB {
+		return fmt.Errorf("argon2 memoryKiB out of bounds: %d (allowed %d..%d)", mKiB, kdfMinMemoryKiB, kdfMaxMemoryKiB)
+	}
+	if p < kdfMinParallel || p > kdfMaxParallel {
+		return fmt.Errorf("argon2 parallelism out of bounds: %d (allowed %d..%d)", p, kdfMinParallel, kdfMaxParallel)
+	}
+	// Also bound relative to CPU to tame CPU exhaustion (soft cap)
+	maxRel := runtime.NumCPU() * 2
+	if int(p) > maxRel {
+		return fmt.Errorf("argon2 parallelism too high for this system: %d (max %d)", p, maxRel)
+	}
 	return nil
 }
 
@@ -556,6 +613,11 @@ func decryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		return fmt.Errorf("invalid chunk size %d", h.ChunkSize)
 	}
 
+	// SECURITY: validate KDF params from header (pre-Argon2)
+	if err := validateKDFParams(h.TimeCost, h.MemoryKiB, h.Parallel); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(filepath.Dir(outPath), 0700); err != nil {
 		return err
 	}
@@ -568,8 +630,8 @@ func decryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		out.Close()
 	}()
 
-	// Derive key from stored parameters
-	key := deriveKeyArgon2id(pw, h.Salt[:], h.TimeCost, h.MemoryKiB, h.Parallel, derivedKeyL)
+	// Derive key from stored parameters (SECURITY: domain-separated Argon2id)
+	key := deriveKey(pw, h.Salt[:], h.TimeCost, h.MemoryKiB, h.Parallel, derivedKeyL)
 	defer zeroize(key)
 
 	aead, err := chacha20poly1305.New(key)
@@ -601,11 +663,9 @@ func decryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		}
 
 		nonce := deriveChunkNonce(h.BaseNonce, chunkIdx)
-		aad := make([]byte, 0, len(headerBytes)+8)
-		aad = append(aad, headerBytes...)
-		var idxLE [8]byte
-		binary.LittleEndian.PutUint64(idxLE[:], chunkIdx)
-		aad = append(aad, idxLE[:]...)
+
+		// SECURITY: bind length into AAD on decrypt side as well
+		aad := makeAAD(headerBytes, chunkIdx, plen)
 
 		pt, err := aead.Open(nil, nonce[:], ct, aad)
 		if err != nil {
@@ -620,6 +680,7 @@ func decryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		}
 		written += uint64(len(pt))
 		zeroize(pt)
+		runtime.KeepAlive(pt) // SECURITY: ensure wipe isn't optimized away
 
 		pct := int(float64(written) * 100 / float64(h.FileSize))
 		if pct != lastPct && (pct%5 == 0 || pct == 100) {
