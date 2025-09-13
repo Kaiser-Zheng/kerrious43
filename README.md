@@ -44,7 +44,7 @@ go build -o kerrious43 .
 **Encrypt a directory**
 
 ```bash
-./kerrious43 -e -in /path/to/dir
+./kerrious43 -e -in /path/to/dir/
 # outputs to ./encrypted_files/ preserving relative layout, with .enc suffix
 ```
 
@@ -66,9 +66,13 @@ go build -o kerrious43 .
 
 ### File format summary
 
-* Header (73 bytes): `magic ("secfile") | version | argon2 t | argon2 m (KiB) | argon2 p | chunk size | salt (32B) | base nonce (12B) | original file size (8B)`.
-* For each chunk: `4-byte LE plaintext length | ciphertext (len + 16B tag)`.
-* AAD used for each chunk: `header || chunkIndex || chunkLength`.
+* **Header (73 bytes)**: `magic ("SECFILE") | version | argon2 t | argon2 m (KiB) | argon2 p | chunk size | salt (32B) | base nonce (12B) | original file size (8B)`.
+* **Per chunk**: `4-byte LE plaintext length | ciphertext (len + 16B tag)`.
+* **Footer**: `1-byte flag (0xFF) | 16-byte tag` authenticating the header, total chunk count, and declared file size.
+* **Associated data (AAD)**:
+
+  * For each chunk: `header || chunkIndex || chunkLength`.
+  * For the footer: `header || totalChunkCount || fileSize`.
 
 ### Recommendations
 
@@ -81,4 +85,4 @@ go build -o kerrious43 .
 ## Contributing
 
 * Fork the repository, implement changes on a feature branch, open a pull request with a clear security rationale for changes.
-* Include tests that cover parsing, decryption with tampered headers/lengths, and KDF parameter edge cases.
+* Include tests that cover parsing, decryption with tampered headers/lengths/footer, and KDF parameter edge cases.

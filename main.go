@@ -49,6 +49,9 @@ const (
 	kdfMaxMemoryKiB = uint32(1024 * 1024) // 1 GiB
 	kdfMinParallel  = uint8(1)
 	kdfMaxParallel  = uint8(8)
+
+	// Authenticated end-of-stream footer marker (fixes: header auth for empty files + explicit end)
+	footerFlag = 0xFF
 )
 
 // Header is serialized exactly in the order of fields below (little-endian for integers).
@@ -66,19 +69,29 @@ type Header struct {
 }
 
 // EncodeHeader returns the exact bytes written to file for use as AAD.
+// Implemented as a fixed-size write (no ignored errors).
 func EncodeHeader(h *Header) []byte {
-	buf := &bytes.Buffer{}
-	buf.Grow(73)
-	buf.Write(h.Magic[:])
-	buf.WriteByte(h.Version)
-	_ = binary.Write(buf, binary.LittleEndian, h.TimeCost)
-	_ = binary.Write(buf, binary.LittleEndian, h.MemoryKiB)
-	buf.WriteByte(h.Parallel)
-	_ = binary.Write(buf, binary.LittleEndian, h.ChunkSize)
-	buf.Write(h.Salt[:])
-	buf.Write(h.BaseNonce[:])
-	_ = binary.Write(buf, binary.LittleEndian, h.FileSize)
-	return buf.Bytes()
+	b := make([]byte, 73)
+	off := 0
+	copy(b[off:], h.Magic[:])
+	off += 7
+	b[off] = h.Version
+	off++
+	binary.LittleEndian.PutUint32(b[off:], h.TimeCost)
+	off += 4
+	binary.LittleEndian.PutUint32(b[off:], h.MemoryKiB)
+	off += 4
+	b[off] = h.Parallel
+	off++
+	binary.LittleEndian.PutUint32(b[off:], h.ChunkSize)
+	off += 4
+	copy(b[off:], h.Salt[:])
+	off += saltSize
+	copy(b[off:], h.BaseNonce[:])
+	off += baseNonceSize
+	binary.LittleEndian.PutUint64(b[off:], h.FileSize)
+	// off += 8 // total should be 73
+	return b
 }
 
 func WriteHeader(w io.Writer, h *Header) ([]byte, error) {
@@ -470,8 +483,8 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		return err
 	}
 	defer func() {
-		out.Sync()
-		out.Close()
+		_ = out.Sync()
+		_ = out.Close()
 	}()
 
 	// Per-file: salt and base nonce
@@ -563,7 +576,7 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 
 		processed += int64(n)
 		pct := int(float64(processed) * 100 / float64(fi.Size()))
-		if pct != lastPct && (pct%5 == 0 || pct == 100) {
+		if fi.Size() > 0 && pct != lastPct && (pct%5 == 0 || pct == 100) {
 			printfSafe("[ENCRYPT] %s  %d%%  (%d/%d bytes)\n", inPath, pct, processed, fi.Size())
 			lastPct = pct
 		}
@@ -571,6 +584,31 @@ func encryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		if readErr == io.ErrUnexpectedEOF {
 			break
 		}
+	}
+
+	// ----- Authenticated footer: binds header + chunk count + file size -----
+	var chunksLE [8]byte
+	binary.LittleEndian.PutUint64(chunksLE[:], chunkIdx)
+	var fsLE [8]byte
+	binary.LittleEndian.PutUint64(fsLE[:], uint64(fi.Size()))
+
+	aadFooter := make([]byte, 0, len(headerBytes)+8+8)
+	aadFooter = append(aadFooter, headerBytes...)
+	aadFooter = append(aadFooter, chunksLE[:]...)
+	aadFooter = append(aadFooter, fsLE[:]...)
+
+	// Reserve a nonce value for the footer that cannot collide with any chunk.
+	footerNonce := deriveChunkNonce(h.BaseNonce, ^uint64(0))
+
+	// Seal over empty plaintext; the result is just the 16-byte tag.
+	footerTag := aead.Seal(nil, footerNonce[:], nil, aadFooter)
+
+	// Write marker + tag
+	if _, err := out.Write([]byte{footerFlag}); err != nil {
+		return fmt.Errorf("failed to write footer flag: %w", err)
+	}
+	if _, err := out.Write(footerTag); err != nil {
+		return fmt.Errorf("failed to write footer tag: %w", err)
 	}
 
 	return nil
@@ -626,8 +664,8 @@ func decryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		return err
 	}
 	defer func() {
-		out.Sync()
-		out.Close()
+		_ = out.Sync()
+		_ = out.Close()
 	}()
 
 	// Derive key from stored parameters (SECURITY: domain-separated Argon2id)
@@ -683,12 +721,50 @@ func decryptFile(inPath, outPath string, pw []byte, stats *stats) error {
 		runtime.KeepAlive(pt) // SECURITY: ensure wipe isn't optimized away
 
 		pct := int(float64(written) * 100 / float64(h.FileSize))
-		if pct != lastPct && (pct%5 == 0 || pct == 100) {
+		if h.FileSize > 0 && pct != lastPct && (pct%5 == 0 || pct == 100) {
 			printfSafe("[DECRYPT] %s  %d%%  (%d/%d bytes)\n", inPath, pct, written, h.FileSize)
 			lastPct = pct
 		}
 		chunkIdx++
 	}
+
+	// ----- Verify authenticated footer -----
+	var flag [1]byte
+	if _, err := io.ReadFull(in, flag[:]); err != nil {
+		return fmt.Errorf("missing footer: %w", err)
+	}
+	if flag[0] != footerFlag {
+		return errors.New("invalid or missing footer flag")
+	}
+
+	ctFooter := make([]byte, tagSize)
+	if _, err := io.ReadFull(in, ctFooter); err != nil {
+		return fmt.Errorf("failed to read footer tag: %w", err)
+	}
+
+	var chunksLE [8]byte
+	binary.LittleEndian.PutUint64(chunksLE[:], chunkIdx)
+	var fsLE [8]byte
+	binary.LittleEndian.PutUint64(fsLE[:], h.FileSize)
+
+	aadFooter := make([]byte, 0, len(headerBytes)+8+8)
+	aadFooter = append(aadFooter, headerBytes...)
+	aadFooter = append(aadFooter, chunksLE[:]...)
+	aadFooter = append(aadFooter, fsLE[:]...)
+
+	footerNonce := deriveChunkNonce(h.BaseNonce, ^uint64(0))
+	if _, err := aead.Open(nil, footerNonce[:], ctFooter, aadFooter); err != nil {
+		zeroize(ctFooter)
+		return errors.New("footer authentication failed (tampered file or wrong password)")
+	}
+	zeroize(ctFooter)
+
+	// Optional strictness: reject trailing data (commented out by default)
+	// one := make([]byte, 1)
+	// if n, _ := in.Read(one); n != 0 {
+	// 	return errors.New("trailing data after authenticated footer")
+	// }
+
 	return nil
 }
 
